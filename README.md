@@ -2,7 +2,7 @@
 
 > One terminal. One keypress. No hunting.
 
-Windows scatters its settings across a dozen different menus. SystemToolkit doesn't. Launch it and everything is a keypress away system specs, activation status, network adapters, power settings, and more, all from a clean terminal interface.
+Windows scatters its settings across a dozen different menus. Admin-Toolbox doesn't. Launch it and everything is a keypress away system specs, activation status, network adapters, power settings, and more, all from a clean terminal interface.
 
 ---
 
