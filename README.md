@@ -4,6 +4,15 @@
 
 Windows scatters its settings across a dozen different menus. Admin-Toolbox doesn't. Launch it and everything is a keypress away system specs, activation status, network adapters, power settings, and more, all from a clean terminal interface.
 
+### Quick Run
+
+Open PowerShell and paste:
+
+```powershell
+irm https://raw.githubusercontent.com/DanielP33/Admin-Toolbox/refs/heads/main/Admin-Toolbox.ps1 | iex
+```
+
+
 ---
 
 ## What it does
