@@ -647,42 +647,71 @@ function Show-ContextMenu {
     }
 }
 
+
 ### Spicetify ###
-# Spicetify doesn't come with a convenient update shortcut, so I added one to the
-# right-click desktop menu. It's a small quality-of-life thing that saves a few
-# steps for anyone who uses Spicetify regularly.
-# The entry now lives under HKCU\Software\Classes (per-user, no admin needed, and
-# 'spicetify update' runs as you rather than elevated). The status check reads the
-# merged HKCR view so entries from the old version are still detected.
+# Adds a Spicetify update shortcut to the desktop background right-click menu.
+# Uses HKCU\Software\Classes, so no administrator privileges are required.
+# The command runs as the current user, without elevation.
+
 $script:SpicetifyKey = "HKCU:\Software\Classes\DesktopBackground\Shell\SpicetifyUpdate"
 
 function Get-SpicetifyStatus {
-    if (Test-Path "Registry::HKEY_CLASSES_ROOT\DesktopBackground\Shell\SpicetifyUpdate") { return "APPLIED" }
-    return "NOT APPLIED"
+    $userKey = "$script:SpicetifyKey\command"
+    $machineKey = "HKLM:\SOFTWARE\Classes\DesktopBackground\Shell\SpicetifyUpdate\command"
+    $mergedKey = "Registry::HKEY_CLASSES_ROOT\DesktopBackground\Shell\SpicetifyUpdate\command"
+
+    if (-not (Test-Path $mergedKey)) {
+        return "NOT APPLIED"
+    }
+
+    $command = (Get-Item -Path $mergedKey).GetValue("")
+
+    if ($command -match "spicetify\s+update") {
+        return "APPLIED"
+    }
+
+    return "BROKEN"
 }
 
 function Invoke-SpicetifyContextMenu {
     param([switch]$Apply)
+
     $key = $script:SpicetifyKey
+
     if ($Apply) {
+        # Create the context menu entry.
         New-Item -Path $key -Force | Out-Null
-        Set-ItemProperty -Path $key -Name "MUIVerb"  -Value "Spicetify Update"
-        Set-ItemProperty -Path $key -Name "Icon"     -Value "$env:APPDATA\Spotify\Spotify.exe"
+
+        Set-ItemProperty -Path $key -Name "MUIVerb" -Value "Spicetify Update"
+        Set-ItemProperty -Path $key -Name "Icon" -Value "$env:APPDATA\Spotify\Spotify.exe"
         Set-ItemProperty -Path $key -Name "Position" -Value "Middle"
-        New-Item -Path "$key\command" -Force | Out-Null
-        Set-ItemProperty -Path "$key\command" -Name "(Default)" -Value 'powershell -NoExit -Command "spicetify update"'
-    } else {
+
+        # Create the command subkey.
+        $commandKey = "$key\command"
+        New-Item -Path $commandKey -Force | Out-Null
+
+        # Set the actual registry default value (unnamed).
+        Set-Item -Path $commandKey -Value 'powershell.exe -NoProfile -NoExit -Command "spicetify update"'
+
+        Write-Host "Spicetify context menu entry applied." -ForegroundColor Green
+    }
+    else {
+        # Remove the per-user entry.
         Remove-Item -Path $key -Recurse -Force -ErrorAction SilentlyContinue
-        # Entries made by the old version were machine-wide; clear those too when we can.
+
+        # Remove legacy machine-wide entries when running as administrator.
         if ($script:IsAdmin) {
             Remove-Item -Path "HKLM:\SOFTWARE\Classes\DesktopBackground\Shell\SpicetifyUpdate" -Recurse -Force -ErrorAction SilentlyContinue
         }
+
+        Write-Host "Spicetify context menu entry removed." -ForegroundColor Yellow
     }
 }
 
 function Show-SpicetifyMenu {
     while ($true) {
         Clear-Host
+
         Write-Host "=== Spicetify Context Menu ===" -ForegroundColor Green
         Write-Host @"
 1. Apply context menu entry
@@ -691,16 +720,34 @@ function Show-SpicetifyMenu {
 "@ -ForegroundColor White
 
         $status = Get-SpicetifyStatus
-        $color  = if ($status -eq "APPLIED") { "Green" } else { "Red" }
+
+        $color = switch ($status) {
+            "APPLIED"     { "Green" }
+            "BROKEN"      { "Yellow" }
+            default       { "Red" }
+        }
+
         Write-Host "Status: $status" -ForegroundColor $color
         Write-Host "==============================" -ForegroundColor Green
 
         $choice = Read-Host "Select an option"
+
         switch ($choice) {
-            '1' { Invoke-SpicetifyContextMenu -Apply }
-            '2' { Invoke-SpicetifyContextMenu }
-            { $_ -in '3', 'q' } { return }
-            default { Write-Host "Invalid option." -ForegroundColor Red; Start-Sleep -Milliseconds 800 }
+            '1' {
+                Invoke-SpicetifyContextMenu -Apply
+                Start-Sleep -Milliseconds 800
+            }
+            '2' {
+                Invoke-SpicetifyContextMenu
+                Start-Sleep -Milliseconds 800
+            }
+            { $_ -in '3', 'q' } {
+                return
+            }
+            default {
+                Write-Host "Invalid option." -ForegroundColor Red
+                Start-Sleep -Milliseconds 800
+            }
         }
     }
 }
