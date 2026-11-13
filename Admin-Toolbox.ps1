@@ -2,25 +2,90 @@
 
 # Aesthetics
 $host.UI.RawUI.BackgroundColor = 'Black'
+$ProgressPreference = 'SilentlyContinue'   # progress rendering slows cmdlets down for no benefit here
 
-### Elevation ###
-# Elevate once at launch instead of spawning a new elevated PowerShell for every toggle.
-# If UAC is declined (or the script is piped in without a file path) we carry on
-# unelevated, and admin-only actions explain themselves instead of failing silently.
+# Warm the system-specs cache in the background at launch so option 1 opens instantly.
+# Set to $false to only collect specs when you open them.
+$script:PrefetchSpecs = $true
+
 $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $script:IsAdmin -and $PSCommandPath) {
+
+# Script-wide state
+$script:Pool = $null
+$script:Jobs = @{}
+$script:BgData = @{}
+$script:PsExe = $null
+$script:ActivationStatus = 'Checking...'
+$script:GpuCache = $null
+$script:GpuDriverCache = $null
+$script:SystemSpecsCache = $null
+$script:CoreIsoUrlFile = $null
+$script:ChangeLogPath = Join-Path $env:LOCALAPPDATA 'SystemToolbox\ChangeLog.txt'
+
+### Change log ###
+# Plain .NET append: no cmdlet overhead, creates the folder only if it's missing.
+function Write-ToolChange {
+    param([Parameter(Mandatory=$true)][string]$Change)
     try {
-        Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs `
-            -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`""
-        exit
-    } catch { }
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($script:ChangeLogPath))
+        $line = '{0} | {1}{2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Change, [Environment]::NewLine
+        [IO.File]::AppendAllText($script:ChangeLogPath, $line)
+    } catch {
+        Write-Verbose "Could not write toolbox change log: $_"
+    }
 }
 
-function Test-AdminOrWarn {
-    if ($script:IsAdmin) { return $true }
-    Write-Host "This action needs administrator rights. Restart the toolbox and accept the UAC prompt." -ForegroundColor Red
-    Start-Sleep -Milliseconds 1800
-    return $false
+### Elevation ###
+# Least privilege is kept: the toolbox runs normally and only elevates the one action
+# that needs it. Simple registry writes now go straight to reg.exe, which starts in a
+# few milliseconds, instead of paying for a whole new PowerShell host every time.
+function Invoke-Elevated {
+    param(
+        [Parameter(Mandatory=$true)][string]$File,
+        [Parameter(Mandatory=$true)][string]$Arguments,
+        [Parameter(Mandatory=$true)][string]$Change
+    )
+    try {
+        $splat = @{ FilePath = $File; ArgumentList = $Arguments; WindowStyle = 'Hidden'; Wait = $true; PassThru = $true }
+        if (-not $script:IsAdmin) { $splat.Verb = 'RunAs' }
+        $process = Start-Process @splat
+        if ($process.ExitCode -ne 0) { throw "The operation failed (exit code $($process.ExitCode))." }
+        Write-ToolChange $Change
+        return $true
+    } catch {
+        Write-Host "The requested change could not be completed: $_" -ForegroundColor Red
+        Start-Sleep -Milliseconds 1500   # the menu's Clear-Host would wipe this instantly
+        return $false
+    }
+}
+
+# For the few changes that genuinely need PowerShell (services, DNS).
+function Invoke-AdminMutation {
+    param([Parameter(Mandatory=$true)][string]$ScriptText, [Parameter(Mandatory=$true)][string]$Change)
+    if ($script:IsAdmin) {
+        try {
+            $ErrorActionPreference = 'Stop'
+            & ([scriptblock]::Create($ScriptText)) | Out-Null
+            Write-ToolChange $Change
+            return $true
+        } catch {
+            Write-Host "The requested change could not be completed: $_" -ForegroundColor Red
+            Start-Sleep -Milliseconds 1500
+            return $false
+        }
+    }
+    $wrappedScript = @"
+`$ErrorActionPreference = 'Stop'
+try {
+$ScriptText
+    exit 0
+} catch {
+    exit 1
+}
+"@
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($wrappedScript))
+    if (-not $script:PsExe) { $script:PsExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName }
+    return (Invoke-Elevated -File $script:PsExe -Arguments "-NoProfile -NonInteractive -EncodedCommand $encoded" -Change $Change)
 }
 
 # I didn't know how to credit myself without being invasive, so I used the loading
@@ -30,56 +95,221 @@ function Start-Loading {
     Write-Host "Loading, please wait..." -ForegroundColor Yellow
     Write-Host "By Daniel P. ~ Updated 2026" -ForegroundColor Green
 }
-Start-Loading
 
-# Collected once up front. None of this changes while the script runs, so there's
-# no reason to keep asking the system for it on every menu refresh.
-# Plain .NET calls are used where possible: they skip the module-load cost that
-# cmdlets like Get-NetIPAddress / Get-TimeZone pay on first use.
-$userName = [Security.Principal.WindowsIdentity]::GetCurrent().Name.Split('\')[-1]
+### Background jobs ###
+# One shared runspace pool. Slow queries (activation, hardware specs) run on worker
+# threads while the menu is already on screen, and the finished data is picked up later.
+function Start-BgJob {
+    param([Parameter(Mandatory=$true)][string]$Name, [Parameter(Mandatory=$true)][scriptblock]$Work)
+    if (-not $script:Pool) { return }
+    try {
+        $ps = [PowerShell]::Create()
+        $ps.RunspacePool = $script:Pool
+        [void]$ps.AddScript($Work.ToString())
+        $script:Jobs[$Name] = [pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke() }
+    } catch { }
+}
 
-$osInfo = Get-CimInstance -ClassName Win32_OperatingSystem -Property Caption, LastBootUpTime
-$osVersion = $osInfo.Caption -replace '^Microsoft ', ''
-$script:LastBoot = $osInfo.LastBootUpTime   # Cached once, uptime is computed live from this
+# $null = no such job, $false = still running, $true = finished (data is in $script:BgData[$Name]).
+# -Wait blocks on a wait handle, so there's no sleep/poll loop burning time.
+function Update-BgJob {
+    param([Parameter(Mandatory=$true)][string]$Name, [switch]$Wait)
+    $job = $script:Jobs[$Name]
+    if (-not $job) { return $null }
+    if (-not $job.Handle.IsCompleted) {
+        if (-not $Wait) { return $false }
+        [void]$job.Handle.AsyncWaitHandle.WaitOne()
+    }
+    try { $script:BgData[$Name] = @($job.PS.EndInvoke($job.Handle)) } catch { $script:BgData[$Name] = @() }
+    $job.PS.Dispose()
+    $script:Jobs.Remove($Name)
+    return $true
+}
 
-$timezoneDisplayName = [TimeZoneInfo]::Local.DisplayName
+# Windows activation: SoftwareLicensingProduct is one of the slowest WMI classes, so the
+# filter is pushed into the query and only the property we need is requested.
+$script:ActivationQuery = {
+    try {
+        $filter = "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL AND Name LIKE 'Windows%'"
+        $hasWindowsLicense = $false
+        $hasGracePeriod = $false
+        foreach ($license in (Get-CimInstance -ClassName SoftwareLicensingProduct -Filter $filter -Property LicenseStatus)) {
+            $hasWindowsLicense = $true
+            if ($license.LicenseStatus -eq 1) { return 'Activated' }
+            if ($license.LicenseStatus -in 2, 3, 4, 6) { $hasGracePeriod = $true }
+        }
+        if (-not $hasWindowsLicense) { return 'Unknown' }
+        if ($hasGracePeriod) { return 'Grace period' }
+        return 'Not activated'
+    } catch {
+        return 'Unknown'
+    }
+}
 
-# Domain-joined machines report their DNS domain instantly via .NET.
-# Workgroup machines return nothing there, so only then do we fall back to CIM.
-$domain = [Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().DomainName
-if (-not $domain) { $domain = (Get-CimInstance -ClassName Win32_ComputerSystem -Property Domain).Domain }
+# Returns $true only when the status just changed (so the menu knows to repaint).
+function Update-ActivationStatus {
+    if ((Update-BgJob -Name 'Activation') -ne $true) { return $false }
+    $value = @($script:BgData['Activation'])[0]
+    $script:ActivationStatus = if ($value) { [string]$value } else { 'Unknown' }
+    return $true
+}
 
-$script:GpuCache = $null
-$script:SystemSpecsCache = $null
-$script:CoreIsoUrlFile = $null
+# Hardware specs. Self-contained so it can run on a worker thread. It skips the Storage
+# module entirely (the slowest part of the old version) and talks to WMI directly:
+#   - drive letter -> physical disk via Win32_LogicalDiskToPartition
+#   - disk health via MSFT_PhysicalDisk (what Get-PhysicalDisk wraps)
+$script:SpecsQuery = {
+    $specs = New-Object 'System.Collections.Generic.List[object]'
+    try {
+        $specs.Add([pscustomobject]@{ Kind = 'Text'; Text = '==== System Specifications ====' })
 
-# Picks the "real" interface: must be Up, physical-looking, and have an IPv4 that
-# isn't link-local. Adapters with a gateway win, then wired beats Wi-Fi.
-# (Gateway check catches VPN/virtual adapters better than matching on names.)
-function Get-PrimaryIPv4 {
-    $candidates = foreach ($nic in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+        $board = Get-CimInstance -ClassName Win32_BaseBoard -Property Product | Select-Object -First 1
+        $specs.Add([pscustomobject]@{ Kind = 'Field'; Label = 'Motherboard: '; Value = $board.Product })
+
+        $cpu = Get-CimInstance -ClassName Win32_Processor -Property Name, NumberOfCores, NumberOfLogicalProcessors | Select-Object -First 1
+        $specs.Add([pscustomobject]@{
+            Kind    = 'Cpu'
+            Label   = 'CPU: '
+            Name    = $cpu.Name.Trim()
+            Cores   = $cpu.NumberOfCores
+            Threads = $cpu.NumberOfLogicalProcessors
+        })
+
+        $ddrNames = @{ 20 = 'DDR'; 21 = 'DDR2'; 24 = 'DDR3'; 26 = 'DDR4'; 27 = 'LPDDR'; 28 = 'LPDDR2'; 29 = 'LPDDR3'; 30 = 'LPDDR4'; 34 = 'DDR5'; 35 = 'LPDDR5' }
+        $mem = @(Get-CimInstance -ClassName Win32_PhysicalMemory -Property Capacity, ConfiguredClockSpeed, FormFactor, SMBIOSMemoryType, MemoryType, TypeDetail)
+        $ramGB = [math]::Round(($mem | Measure-Object -Property Capacity -Sum).Sum / 1GB, 2)
+        $ramTypes = foreach ($stick in $mem) {
+            $moduleType = if ([int]$stick.FormFactor -eq 12) { 'SODIMM' }
+                          elseif (([int]$stick.TypeDetail -band 0x2000) -ne 0) { 'RDIMM' }
+                          elseif (([int]$stick.TypeDetail -band 0x4000) -ne 0) { 'UDIMM' }
+                          elseif ([int]$stick.FormFactor -eq 8) { 'DIMM' }
+                          else { $null }
+            $ddrType = $ddrNames[[int]$stick.SMBIOSMemoryType]
+            if (-not $ddrType) { $ddrType = $ddrNames[[int]$stick.MemoryType] }
+            (@($moduleType, $ddrType) -ne $null) -join ' '
+        }
+        $ramTypeSummary = @($ramTypes | Where-Object { $_ } | Select-Object -Unique) -join ', '
+        $configuredSpeeds = @($mem | ForEach-Object { if ($_.ConfiguredClockSpeed) { [int]$_.ConfiguredClockSpeed } } | Select-Object -Unique)
+        $configuredSpeedText = if ($configuredSpeeds.Count -eq 1) { "$($configuredSpeeds[0])MHz" }
+                               elseif ($configuredSpeeds.Count -gt 1) { "$($configuredSpeeds -join '/')MHz" }
+                               else { 'Unknown speed' }
+        $ramDescription = "$ramGB GB ($($mem.Count) sticks | $configuredSpeedText"
+        if ($ramTypeSummary) { $ramDescription += " | $ramTypeSummary" }
+        $ramDescription += ')'
+        $specs.Add([pscustomobject]@{ Kind = 'Field'; Label = 'RAM: '; Value = $ramDescription })
+
+        # NVIDIA first, then AMD, then Intel, so laptops report the discrete card.
+        $cards = @(Get-CimInstance -ClassName Win32_VideoController -Property Name, DriverVersion)
+        $pick = $cards | Where-Object { $_.Name -match 'NVIDIA' } | Select-Object -First 1
+        if (-not $pick) { $pick = $cards | Where-Object { $_.Name -match 'AMD|Radeon' } | Select-Object -First 1 }
+        if (-not $pick) { $pick = $cards | Where-Object { $_.Name -match 'Intel' } | Select-Object -First 1 }
+        if (-not $pick) { $pick = $cards | Select-Object -First 1 }
+        $gpuName = if ($pick) { $pick.Name } else { 'Not Found' }
+        $gpuDriver = if ($pick -and $pick.DriverVersion) { $pick.DriverVersion } else { 'Unknown' }
+        $specs.Add([pscustomobject]@{ Kind = 'Gpu'; Label = 'GPU: '; Value = $gpuName })
+        $specs.Add([pscustomobject]@{ Kind = 'Field'; Label = 'GPU Driver: '; Value = $gpuDriver })
+
+        $specs.Add([pscustomobject]@{ Kind = 'Text'; Text = 'Disk Info:' })
+        $driveToDisk = @{}
+        try {
+            foreach ($link in @(Get-CimInstance -ClassName Win32_LogicalDiskToPartition -ErrorAction Stop)) {
+                $letter = [string]$link.Dependent.DeviceID
+                $partition = [string]$link.Antecedent.DeviceID
+                if (-not $letter -or $partition -notmatch 'Disk #(\d+)') { continue }
+                $number = [int]$Matches[1]
+                if (-not $driveToDisk.ContainsKey($letter)) { $driveToDisk[$letter] = New-Object 'System.Collections.Generic.List[int]' }
+                if (-not $driveToDisk[$letter].Contains($number)) { $driveToDisk[$letter].Add($number) }
+            }
+        } catch { }
+        $volumes = Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3' -Property DeviceID, Size, FreeSpace | Sort-Object DeviceID
+        foreach ($v in $volumes) {
+            $diskIdentity = if ($driveToDisk.ContainsKey($v.DeviceID)) { " (Disk $($driveToDisk[$v.DeviceID] -join ', '))" } else { ' (Physical disk unknown)' }
+            $specs.Add([pscustomobject]@{
+                Kind  = 'Drive'
+                Label = "Drive $($v.DeviceID)$diskIdentity | Total: "
+                Total = ("{0:N2} GB" -f ($v.Size / 1GB))
+                Used  = ("{0:N2} GB" -f (($v.Size - $v.FreeSpace) / 1GB))
+                Free  = ("{0:N2} GB" -f ($v.FreeSpace / 1GB))
+            })
+        }
+
+        try {
+            $healthNames = @{ 0 = 'Healthy'; 1 = 'Warning'; 2 = 'Unhealthy'; 5 = 'Unknown' }
+            $opNames = @{ 0 = 'Unknown'; 1 = 'Other'; 2 = 'OK'; 3 = 'Degraded'; 4 = 'Stressed'; 5 = 'Predictive Failure'; 6 = 'Error'; 7 = 'Non-Recoverable Error'
+                          8 = 'Starting'; 9 = 'Stopping'; 10 = 'Stopped'; 11 = 'In Service'; 12 = 'No Contact'; 13 = 'Lost Communication'; 14 = 'Aborted'
+                          15 = 'Dormant'; 16 = 'Supporting Entity in Error'; 17 = 'Completed' }
+            $disks = @(Get-CimInstance -Namespace 'root\Microsoft\Windows\Storage' -ClassName MSFT_PhysicalDisk `
+                -Property DeviceId, FriendlyName, SerialNumber, UniqueId, HealthStatus, OperationalStatus -ErrorAction Stop |
+                Sort-Object { [int]$_.DeviceId })
+            foreach ($d in $disks) {
+                $serial = if ($d.SerialNumber) { ([string]$d.SerialNumber).Trim() } elseif ($d.UniqueId) { [string]$d.UniqueId } else { 'ID unavailable' }
+                $health = if ($healthNames.ContainsKey([int]$d.HealthStatus)) { $healthNames[[int]$d.HealthStatus] } else { "Status $($d.HealthStatus)" }
+                $operational = @($d.OperationalStatus | ForEach-Object { if ($opNames.ContainsKey([int]$_)) { $opNames[[int]$_] } else { "Status $_" } }) -join ', '
+                $specs.Add([pscustomobject]@{
+                    Kind  = 'Field'
+                    Label = "Disk $($d.DeviceId) Health: "
+                    Value = "$($d.FriendlyName) | S/N: $serial | $health | $operational"
+                })
+            }
+            if (-not $disks.Count) {
+                $specs.Add([pscustomobject]@{ Kind = 'Field'; Label = 'Disk Health: '; Value = 'Not reported by this system' })
+            }
+        } catch {
+            $specs.Add([pscustomobject]@{ Kind = 'Field'; Label = 'Disk Health: '; Value = 'Not available' })
+        }
+
+        $specs.Add([pscustomobject]@{ Kind = 'Text'; Text = '==============================' })
+    } catch { }
+    $specs
+}
+
+# Active, physical-looking adapters: must be Up and have a non-link-local IPv4. Virtual
+# adapters (VMware, VirtualBox, Hyper-V, loopback) are skipped. Pure .NET, no module load.
+function Get-ActiveNics {
+    foreach ($nic in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
         if ($nic.OperationalStatus -ne 'Up') { continue }
         $type = $nic.NetworkInterfaceType.ToString()
         if ($type -notin 'Ethernet', 'GigabitEthernet', 'FastEthernet', 'Wireless80211') { continue }
         if ($nic.Name -match '^(VMware|VirtualBox|vEthernet|Loopback)') { continue }
         $props = $nic.GetIPProperties()
-        $addr = $props.UnicastAddresses |
-            Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' -and $_.Address.ToString() -notlike '169.*' } |
-            Select-Object -First 1
-        if (-not $addr) { continue }
+        $ipv4 = $null
+        foreach ($unicast in $props.UnicastAddresses) {
+            if ($unicast.Address.AddressFamily -eq 'InterNetwork' -and $unicast.Address.ToString() -notlike '169.*') {
+                $ipv4 = $unicast.Address.ToString()
+                break
+            }
+        }
+        if (-not $ipv4) { continue }
         [pscustomobject]@{
-            IP      = $addr.Address.ToString()
-            Gateway = [bool]$props.GatewayAddresses.Count
-            Wired   = ($type -ne 'Wireless80211')
+            Nic         = $nic
+            Name        = $nic.Name
+            Description = $nic.Description
+            IP          = $ipv4
+            HasGateway  = ($props.GatewayAddresses.Count -gt 0)
+            IsWired     = ($type -ne 'Wireless80211')
         }
     }
-    $best = $candidates |
-        Sort-Object @{ Expression = 'Gateway'; Descending = $true }, @{ Expression = 'Wired'; Descending = $true } |
-        Select-Object -First 1
-    if ($best) { return $best.IP }
+}
+
+# The "real" interface: adapters with a gateway win, then wired beats Wi-Fi.
+# (Gateway check catches VPN/virtual adapters better than matching on names.)
+function Get-PrimaryNic {
+    $best = $null
+    foreach ($candidate in (Get-ActiveNics)) {
+        if (-not $best -or
+            ($candidate.HasGateway -and -not $best.HasGateway) -or
+            ($candidate.HasGateway -eq $best.HasGateway -and $candidate.IsWired -and -not $best.IsWired)) {
+            $best = $candidate
+        }
+    }
+    return $best
+}
+
+function Get-PrimaryIPv4 {
+    $nic = Get-PrimaryNic
+    if ($nic) { return $nic.IP }
     return 'No IP'
 }
-$ip = Get-PrimaryIPv4
 
 ### Shared helpers ###
 # Windows respawns the shell on its own after it's killed. Only start it manually
@@ -94,120 +324,454 @@ function Restart-Explorer {
     Start-Process explorer.exe
 }
 
+# One consistent look for short messages: cleared screen, cyan title, coloured message.
+# With -Milliseconds it shows for that long and moves on; without, it waits for Enter.
+function Show-Notice {
+    param([string]$Title, [string]$Message, [ConsoleColor]$Color = 'White', [int]$Milliseconds = 0)
+    Clear-Host
+    Write-Host $Title -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host $Message -ForegroundColor $Color
+    if ($Milliseconds -gt 0) { Start-Sleep -Milliseconds $Milliseconds }
+    else { Write-Host ''; Read-Host 'Press Enter to return' | Out-Null }
+}
+
+# Every Write-Host call is a round trip to the console. Static screens are therefore
+# pre-built once as a few multi-line, single-colour chunks and printed with one call each.
+function Write-Batches {
+    param($Batches)
+    foreach ($batch in $Batches) {
+        if ($batch.NoNewline) { Write-Host $batch.Text -ForegroundColor $batch.Color -NoNewline }
+        else { Write-Host $batch.Text -ForegroundColor $batch.Color }
+    }
+}
+
+# Reads a menu choice. While background work is still finishing it polls the keyboard,
+# so the screen can repaint the moment the result arrives (the activation status fills
+# in on its own) without losing what you've typed. When nothing is pending it simply
+# blocks on the next key, using no CPU. Falls back to Read-Host if there's no real console.
+function Read-MenuChoice {
+    param([string]$Prompt = 'Select an option', [scriptblock]$Poll, [scriptblock]$Redraw)
+    try {
+        $buffer = New-Object System.Text.StringBuilder
+        [void][Console]::KeyAvailable
+        Write-Host -NoNewline "${Prompt}: "
+        while ($true) {
+            if (-not [Console]::KeyAvailable) {
+                $state = if ($Poll) { & $Poll } else { $null }
+                if ($state -eq $true -and $Redraw) {
+                    & $Redraw
+                    Write-Host -NoNewline ("${Prompt}: " + $buffer.ToString())
+                }
+                if ($null -ne $state) { Start-Sleep -Milliseconds 40; continue }
+            }
+            $key = [Console]::ReadKey($true)
+            if ($key.Key -eq 'Enter') { Write-Host ''; return $buffer.ToString().Trim() }
+            if ($key.Key -eq 'Backspace') {
+                if ($buffer.Length -gt 0) { [void]$buffer.Remove($buffer.Length - 1, 1); [Console]::Write("`b `b") }
+            } elseif ($key.KeyChar -ge ' ') {
+                [void]$buffer.Append($key.KeyChar)
+                [Console]::Write($key.KeyChar)
+            }
+        }
+    } catch {
+        return (Read-Host $Prompt).Trim()
+    }
+}
+
 ### Main Menu ###
+function Write-MainMenuScreen {
+    Clear-Host
+    Write-Batches $script:MenuHead
+    $statusColor = switch ($script:ActivationStatus) {
+        'Activated'   { 'Green' }
+        'Checking...' { 'Yellow' }
+        default       { 'Red' }
+    }
+    Write-Host $script:OsPrefix -NoNewline -ForegroundColor Blue
+    Write-Host $script:ActivationStatus -ForegroundColor $statusColor
+    Write-Host $script:TimezoneLine -ForegroundColor DarkRed
+    $uptime = (Get-Date) - $script:LastBoot
+    Write-Host ("Uptime: {0}d {1}h {2}m" -f $uptime.Days, $uptime.Hours, $uptime.Minutes) -ForegroundColor Cyan
+    Write-Host ''
+    Write-Batches $script:MenuBody
+    Write-Host ''
+}
+
 function Show-MainMenu {
+    $items = @(
+        @{ Key='1';  Label='View System Specifications'; Column='System'; Group='System'; Action={ Show-SystemSpecifications } },
+        @{ Key='2';  Label='View Activation Settings'; Column='System'; Group='System'; Action={ Start-Process 'ms-settings:activation' } },
+        @{ Key='3';  Label='Computer Name Settings'; Column='System'; Group='System'; Action={ Start-Process 'SystemPropertiesComputerName.exe' } },
+        @{ Key='4';  Label='Date & Time Settings'; Column='System'; Group='System'; Action={ Start-Process 'ms-settings:dateandtime' } },
+        @{ Key='5';  Label='Core Isolation [W11]'; Column='System'; Group='System'; Action={ CreateAndOpenCoreIsolationURL } },
+        @{ Key='6';  Label='Computer Management'; Column='System'; Group='System'; Action={ Start-Process 'compmgmt.msc' } },
+        @{ Key='7';  Label='Network Adapters'; Column='System'; Group='System'; Action={ Start-Process 'ncpa.cpl' } },
+        @{ Key='8';  Label='Energy Settings'; Column='System'; Group='System'; Action={ Start-Process 'powercfg.cpl' } },
+        @{ Key='9';  Label='Task Scheduler'; Column='System'; Group='System'; Action={ Start-Process 'taskschd.msc' } },
+        @{ Key='10'; Label='Mouse Settings'; Column='System'; Group='System'; Action={ Start-Process 'control.exe' -ArgumentList 'main.cpl,,2' } },
+        @{ Key='11'; Label='Event Viewer'; Column='System'; Group='System'; Action={ Start-Process 'eventvwr.msc' } },
+        @{ Key='12'; Label='Windows Update'; Column='System'; Group='System'; Action={ Start-Process 'ms-settings:windowsupdate' } },
+        @{ Key='13'; Label='Task Manager'; Column='System'; Group='System'; Action={ Start-Process 'taskmgr.exe' } },
+        @{ Key='14'; Label='Network Tools'; Column='System'; Group='System'; Action={ Show-NetworkTools } },
+        @{ Key='15'; Label='Changelog'; Column='System'; Group='System'; Action={ Show-Changelog } },
+        @{ Key='16'; Label='Windows Tweaks'; Column='Right'; Group='Tweaks'; Action={ WindowsTweaksMenu } },
+        @{ Key='17'; Label='Nvidia Tweaks'; Column='Right'; Group='Tweaks'; Action={ NvidiaTweaksMenu } },
+        @{ Key='18'; Label='Ninite app installer'; Column='Right'; Group='Setup'; Action={ Start-Process 'https://ninite.com' } },
+        @{ Key='19'; Label='AMD Ryzen chipset drivers (TechPowerUp)'; Column='Right'; Group='Setup'; Action={ Start-Process 'https://www.techpowerup.com/download/amd-ryzen-chipset-drivers/' } },
+        @{ Key='20'; Label='Visual C++ runtimes all-in-one (TechPowerUp)'; Column='Right'; Group='Setup'; Action={ Start-Process 'https://www.techpowerup.com/download/visual-c-redistributable-runtime-package-all-in-one/' } }
+    )
+    $itemsByKey = @{}
+    foreach ($item in $items) { $itemsByKey[$item.Key] = $item }
+
+    # Layout is static, so it is computed exactly once.
+    $left = @($items | Where-Object { $_.Column -eq 'System' })
+    $longestLeft = 0
+    foreach ($item in $left) {
+        $lineLength = ("{0}. {1}" -f $item.Key, $item.Label).Length
+        if ($lineLength -gt $longestLeft) { $longestLeft = $lineLength }
+    }
+    $columnWidth = [Math]::Max(64, $longestLeft + 6)
+    $rightDisplay = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($group in @('Tweaks', 'Setup')) {
+        if ($group -eq 'Setup') {
+            $rightDisplay.Add([pscustomobject]@{ IsSpacer = $true; IsHeader = $false; Text = '' })
+            $rightDisplay.Add([pscustomobject]@{ IsSpacer = $false; IsHeader = $true; Text = '--- [First Setup Utilities] ---' })
+        }
+        foreach ($item in ($items | Where-Object { $_.Column -eq 'Right' -and $_.Group -eq $group })) {
+            $rightDisplay.Add([pscustomobject]@{ IsSpacer = $false; IsHeader = $false; Text = ("{0}. {1}" -f $item.Key, $item.Label) })
+        }
+    }
+    $rows = [Math]::Max($left.Count, $rightDisplay.Count)
+    $newline = [Environment]::NewLine
+
+    $head = New-Object 'System.Collections.Generic.List[object]'
+    $head.Add(@{ Text = '==========================================================================='; Color = 'Yellow' })
+    $head.Add(@{ Text = "Username: $userName | Hostname: $env:COMPUTERNAME | Domain: $domain | IP: $ip"; Color = 'Magenta' })
+    $script:MenuHead = $head
+    $script:OsPrefix = "Operating System: $osVersion | Activation: "
+    $script:TimezoneLine = "Timezone: $timezoneDisplayName"
+
+    $body = New-Object 'System.Collections.Generic.List[object]'
+    $body.Add(@{ Text = ("--- [System Information] ---".PadRight($columnWidth) + "--- [Tweaks] ---"); Color = 'Yellow' })
+    $white = New-Object System.Text.StringBuilder
+    for ($i = 0; $i -lt $rows; $i++) {
+        $leftText = if ($i -lt $left.Count) { "{0}. {1}" -f $left[$i].Key, $left[$i].Label } else { '' }
+        $rightRow = if ($i -lt $rightDisplay.Count) { $rightDisplay[$i] } else { $null }
+        $padded = $leftText.PadRight($columnWidth)
+        if ($rightRow -and $rightRow.IsHeader) {
+            # The one row that mixes colours: white left column, yellow right-hand header.
+            if ($white.Length) { $body.Add(@{ Text = $white.ToString(); Color = 'White' }); [void]$white.Clear() }
+            $body.Add(@{ Text = $padded; Color = 'White'; NoNewline = $true })
+            $body.Add(@{ Text = $rightRow.Text; Color = 'Yellow' })
+        } else {
+            $line = if ($rightRow -and -not $rightRow.IsSpacer) { $padded + $rightRow.Text } else { $padded.TrimEnd() }
+            if ($white.Length) { [void]$white.Append($newline) }
+            [void]$white.Append($line)
+        }
+    }
+    if ($white.Length) { $body.Add(@{ Text = $white.ToString(); Color = 'White' }) }
+    $script:MenuBody = $body
+
+    $poll = {
+        if (-not $script:Jobs.ContainsKey('Activation')) { return $null }
+        return (Update-ActivationStatus)
+    }
+    $redraw = { Write-MainMenuScreen }
+
     while ($true) {
-        Clear-Host
-
-        # Uptime is computed fresh each loop from the cached boot time
-        # no extra system calls, just math.
-        $uptime = (Get-Date) - $script:LastBoot
-        $uptimeStr = "{0}d {1}h {2}m" -f $uptime.Days, $uptime.Hours, $uptime.Minutes
-
-        Write-Host "===========================================================================" -ForegroundColor Yellow
-        Write-Host ("Username: $userName | Hostname: $env:COMPUTERNAME | Domain: $domain | IP: $ip") -ForegroundColor Magenta
-        Write-Host ("Operating System: $osVersion") -ForegroundColor Blue
-        Write-Host ("Timezone: $timezoneDisplayName") -ForegroundColor DarkRed
-        Write-Host ("Uptime: $uptimeStr") -ForegroundColor Cyan
-        Write-Host ""
-        Write-Host "--- [System Information] ---                               --- [Tweaks] ---" -ForegroundColor Yellow
-        Write-Host @"
-1.  View System Specifications                             12. Windows Tweaks
-2.  Windows Activation Status                              13. Nvidia Tweaks
-3.  Computer Name Settings
-4.  Date & Time Settings
-5.  Core Isolation [W11]
-6.  Computer Management
-7.  Network Adapters
-8.  Energy Settings
-9.  Task Scheduler
-10. Mouse Settings
-11. Event Viewer
-"@ -ForegroundColor White
-        Write-Host ""
-        $selection = Read-Host "Select an option"
-        switch ($selection) {
-            '1'  { Show-SystemSpecifications }
-            '2'  { Start-Process "ms-settings:activation" }
-            '3'  { Start-Process "SystemPropertiesComputerName.exe" }
-            '4'  { Start-Process "ms-settings:dateandtime" }
-            '5'  { CreateAndOpenCoreIsolationURL }
-            '6'  { Start-Process "compmgmt.msc" }
-            '7'  { Start-Process "ncpa.cpl" }
-            '8'  { Start-Process "powercfg.cpl" }
-            '9'  { Start-Process "taskschd.msc" }
-            '10' { Start-Process "control.exe" -ArgumentList "main.cpl,,2" }
-            '11' { Start-Process "eventvwr.msc" }
-            '12' { WindowsTweaksMenu }
-            '13' { NvidiaTweaksMenu }
-            'q'  { return }   # 'break' here only left the switch, so Q never quit
-            default { Write-Host "Invalid Option." -ForegroundColor Red; Start-Sleep -Milliseconds 800 }
+        Write-MainMenuScreen
+        $selection = Read-MenuChoice -Prompt 'Select an option' -Poll $poll -Redraw $redraw
+        if ($selection -match '^(q|quit)$') { return }
+        $selectedItem = $itemsByKey[$selection]
+        if ($selectedItem) {
+            & $selectedItem.Action
+        } else {
+            Write-Host 'Invalid option.' -ForegroundColor Red
+            Start-Sleep -Milliseconds 800
         }
     }
 }
 
-# GPU info is fetched once and cached. On laptops with an Intel iGPU plus a discrete
-# card, NVIDIA is preferred, then AMD, then whatever is left (Intel).
+# Shared data-driven menu loop for submenus with the same title/options/selection pattern.
+# The option list never changes, so it's rendered into a couple of multi-line chunks once;
+# only the status block is re-evaluated on each pass.
+function Invoke-DataMenu {
+    param(
+        [string]$Title,
+        [array]$Items,
+        [ConsoleColor]$Color = 'Cyan',
+        [scriptblock]$StatusBlock,
+        [string]$Prompt = 'Select an option'
+    )
+    $byKey = @{}
+    $body = New-Object 'System.Collections.Generic.List[object]'
+    $white = New-Object System.Text.StringBuilder
+    $newline = [Environment]::NewLine
+    foreach ($item in $Items) {
+        if ($item.ContainsKey('Section')) {
+            if ($white.Length) { $body.Add(@{ Text = $white.ToString(); Color = 'White' }); [void]$white.Clear() }
+            $body.Add(@{ Text = $item.Section; Color = $Color })
+        } else {
+            $byKey[$item.Key] = $item
+            if ($white.Length) { [void]$white.Append($newline) }
+            [void]$white.Append(("{0}. {1}" -f $item.Key, $item.Label))
+        }
+    }
+    if ($white.Length) { $body.Add(@{ Text = $white.ToString(); Color = 'White' }) }
+
+    while ($true) {
+        Clear-Host
+        Write-Host $Title -ForegroundColor $Color
+        if ($StatusBlock) { & $StatusBlock }
+        Write-Batches $body
+        $choice = (Read-Host $Prompt).Trim()
+        if ($choice -match '^(q|quit)$') { return }
+        $selected = $byKey[$choice]
+        if (-not $selected) {
+            Write-Host 'Invalid option.' -ForegroundColor Red
+            Start-Sleep -Milliseconds 800
+            continue
+        }
+        if ($selected.Action) { & $selected.Action }
+        if ($selected.Exit) { return }
+    }
+}
+
+function Show-Changelog {
+    Clear-Host
+    Write-Host '=== Changes Made by This Toolbox ===' -ForegroundColor Cyan
+    Write-Host "Log file: $script:ChangeLogPath" -ForegroundColor DarkGray
+    Write-Host ''
+    $entries = @()
+    if (Test-Path -LiteralPath $script:ChangeLogPath) {
+        # Only the most recent entries: this stays instant however large the log grows.
+        $entries = @(Get-Content -LiteralPath $script:ChangeLogPath -Tail 200 -ErrorAction SilentlyContinue)
+    }
+    if ($entries.Count) {
+        Write-Host ($entries -join [Environment]::NewLine) -ForegroundColor White
+    } else {
+        Write-Host 'No changes have been recorded yet.' -ForegroundColor Yellow
+    }
+    Write-Host ''
+    Read-Host 'Press Enter to return' | Out-Null
+}
+
+### Network tools ###
+$script:DnsPresets = @(
+    @{ Name = 'Cloudflare';  Servers = @('1.1.1.1', '1.0.0.1') },
+    @{ Name = 'Google';      Servers = @('8.8.8.8', '8.8.4.4') },
+    @{ Name = 'Quad9';       Servers = @('9.9.9.9', '149.112.112.112') },
+    @{ Name = 'AdGuard DNS'; Servers = @('94.140.14.14', '94.140.15.15'); Note = 'blocks ads' }
+)
+$script:DnsTarget = $null
+$script:DnsPick = $null
+$script:DnsCandidates = @()
+
+# Current DNS for one adapter. A NetworkInterface object is a snapshot, so the adapter is
+# looked up again by id every time; that is what lets the screen show a change straight
+# after it's applied. "Manual" means a DNS server is set by hand on the adapter (stored in
+# the registry), otherwise it came from DHCP.
+function Get-NicDnsInfo {
+    param([string]$NicId)
+    $servers = @()
+    foreach ($nic in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+        if ($nic.Id -ne $NicId) { continue }
+        foreach ($address in $nic.GetIPProperties().DnsAddresses) {
+            if (-not $address.IsIPv6SiteLocal) { $servers += $address.ToString() }
+        }
+        break
+    }
+    $manual = $false
+    try {
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$NicId")
+        if ($key) { try { $manual = [bool]$key.GetValue('NameServer') } finally { $key.Close() } }
+    } catch { }
+    $provider = $null
+    if ($servers.Count) {
+        foreach ($preset in $script:DnsPresets) {
+            if ($preset.Servers[0] -eq $servers[0]) { $provider = $preset.Name; break }
+        }
+    }
+    [pscustomobject]@{ Servers = $servers; Manual = $manual; Provider = $provider }
+}
+
+function Write-NetworkStatus {
+    param($NicInfo)
+    $dns = Get-NicDnsInfo -NicId $NicInfo.Nic.Id
+    Write-Host -NoNewline 'Adapter: ' -ForegroundColor Cyan
+    Write-Host "$($NicInfo.Name) ($($NicInfo.IP))" -ForegroundColor White
+    Write-Host -NoNewline 'DNS:     ' -ForegroundColor Cyan
+    if ($dns.Servers.Count) {
+        Write-Host -NoNewline ($dns.Servers -join ', ') -ForegroundColor Green
+        $parts = @()
+        if ($dns.Provider) { $parts += $dns.Provider }
+        if ($dns.Manual) { $parts += 'manual' } else { $parts += 'automatic' }
+        Write-Host " [$($parts -join ' | ')]" -ForegroundColor DarkGray
+    } else {
+        Write-Host 'none' -ForegroundColor Red
+    }
+}
+
+function Show-PublicIp {
+    Clear-Host
+    Write-Host '=== Public IP ===' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host 'Looking up...' -ForegroundColor DarkGray
+    try {
+        $publicIp = (Invoke-RestMethod -Uri 'https://api.ipify.org' -TimeoutSec 7 -ErrorAction Stop).ToString().Trim()
+        Write-Host "Public IP: $publicIp" -ForegroundColor Green
+    } catch {
+        Write-Host "Lookup failed: $_" -ForegroundColor Red
+    }
+    Write-Host ''
+    Read-Host 'Press Enter to return' | Out-Null
+}
+
+function Invoke-DnsFlush {
+    ipconfig.exe /flushdns | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-ToolChange 'Flushed the DNS cache'
+        Show-Notice '=== Flush DNS Cache ===' 'DNS cache flushed.' Green 1200
+    } else {
+        Show-Notice '=== Flush DNS Cache ===' 'DNS cache flush failed.' Red 1600
+    }
+}
+
+# Empty $Servers means "back to automatic (DHCP)". The adapter is addressed by name, so
+# there's no index lookup, and the cache is flushed in the same elevated step.
+function Set-DnsServers {
+    param([string]$Name, [string[]]$Servers)
+    $adapterName = $script:DnsTarget.Name
+    $alias = $adapterName -replace "'", "''"
+    if ($Servers.Count) {
+        $list = (@($Servers | ForEach-Object { "'$_'" }) -join ', ')
+        $scriptText = "Set-DnsClientServerAddress -InterfaceAlias '$alias' -ServerAddresses @($list) -ErrorAction Stop`nipconfig.exe /flushdns | Out-Null"
+        $change = "Set DNS on adapter '$adapterName' to $($Servers -join ', ') ($Name)"
+        $done = "Applied $Name to $adapterName."
+    } else {
+        $scriptText = "Set-DnsClientServerAddress -InterfaceAlias '$alias' -ResetServerAddresses -ErrorAction Stop`nipconfig.exe /flushdns | Out-Null"
+        $change = "Restored automatic DNS (DHCP) on adapter '$adapterName'"
+        $done = "Restored automatic DNS on $adapterName."
+    }
+    Write-Host "Applying $Name..." -ForegroundColor Yellow
+    if (Invoke-AdminMutation -ScriptText $scriptText -Change $change) {
+        Show-Notice '=== DNS Server ===' $done Green 1200
+    }
+}
+
+function Set-DnsFromPreset {
+    param([int]$Index)
+    $preset = $script:DnsPresets[$Index]
+    Set-DnsServers -Name $preset.Name -Servers $preset.Servers
+}
+
+function Read-CustomDns {
+    Clear-Host
+    Write-Host '=== Custom DNS ===' -ForegroundColor Cyan
+    Write-Host "Adapter: $($script:DnsTarget.Name)" -ForegroundColor DarkGray
+    Write-Host 'IPv4 or IPv6 addresses. Type Q to cancel.' -ForegroundColor DarkGray
+    Write-Host ''
+    $address = $null
+    $primary = (Read-Host 'Primary DNS').Trim()
+    if ($primary -match '^(q|quit)$') { return }
+    if (-not [Net.IPAddress]::TryParse($primary, [ref]$address)) {
+        Show-Notice '=== Custom DNS ===' 'That is not a valid IP address.' Red 1500
+        return
+    }
+    $servers = @($primary)
+    $secondary = (Read-Host 'Secondary DNS (optional)').Trim()
+    if ($secondary -match '^(q|quit)$') { return }
+    if ($secondary) {
+        if (-not [Net.IPAddress]::TryParse($secondary, [ref]$address)) {
+            Show-Notice '=== Custom DNS ===' 'That is not a valid IP address.' Red 1500
+            return
+        }
+        $servers += $secondary
+    }
+    Set-DnsServers -Name 'Custom DNS' -Servers $servers
+}
+
+# One adapter: used straight away. Several: pick from a menu in the same style as the rest.
+function Select-DnsAdapter {
+    $nics = @(Get-ActiveNics)
+    if (-not $nics.Count) {
+        Show-Notice '=== DNS Server ===' 'No active network adapters found.' Yellow 1600
+        return $null
+    }
+    if ($nics.Count -eq 1) { return $nics[0] }
+    $script:DnsCandidates = $nics
+    $script:DnsPick = $null
+    $items = @()
+    for ($i = 0; $i -lt $nics.Count; $i++) {
+        $items += @{
+            Key    = [string]($i + 1)
+            Label  = ("{0} ({1}) - {2}" -f $nics[$i].Name, $nics[$i].IP, $nics[$i].Description)
+            Exit   = $true
+            Action = [scriptblock]::Create("`$script:DnsPick = `$script:DnsCandidates[$i]")
+        }
+    }
+    $items += @{ Key = [string]($nics.Count + 1); Label = 'Return'; Exit = $true }
+    Invoke-DataMenu -Title '=== Choose Network Adapter ===' -Items $items -Color Cyan
+    return $script:DnsPick
+}
+
+function Show-DnsMenu {
+    $target = Select-DnsAdapter
+    if (-not $target) { return }
+    $script:DnsTarget = $target
+    $statusBlock = {
+        Write-NetworkStatus $script:DnsTarget
+        Write-Host '=================' -ForegroundColor Cyan
+    }
+    $items = @()
+    for ($i = 0; $i -lt $script:DnsPresets.Count; $i++) {
+        $preset = $script:DnsPresets[$i]
+        $label = "{0,-12} {1}" -f $preset.Name, ($preset.Servers -join ' / ')
+        if ($preset.Note) { $label += " ($($preset.Note))" }
+        $items += @{ Key = [string]($i + 1); Label = $label; Action = [scriptblock]::Create("Set-DnsFromPreset -Index $i") }
+    }
+    $next = $script:DnsPresets.Count
+    $items += @{ Key = [string]($next + 1); Label = 'Custom DNS addresses'; Action = { Read-CustomDns } }
+    $items += @{ Key = [string]($next + 2); Label = 'Automatic (DHCP)'; Action = { Set-DnsServers -Name 'Automatic (DHCP)' -Servers @() } }
+    $items += @{ Key = [string]($next + 3); Label = 'Return'; Exit = $true }
+    Invoke-DataMenu -Title '=== DNS Server ===' -Items $items -Color Cyan -StatusBlock $statusBlock
+}
+
+function Show-NetworkTools {
+    $statusBlock = {
+        $primary = Get-PrimaryNic
+        if ($primary) { Write-NetworkStatus $primary }
+        else { Write-Host 'No active network adapter found.' -ForegroundColor Yellow }
+        Write-Host '=====================' -ForegroundColor Cyan
+    }
+    $items = @(
+        @{ Key='1'; Label='Show public IP'; Action={ Show-PublicIp } },
+        @{ Key='2'; Label='Flush DNS cache'; Action={ Invoke-DnsFlush } },
+        @{ Key='3'; Label='Change DNS server'; Action={ Show-DnsMenu } },
+        @{ Key='4'; Label='Open Network Adapters'; Action={ Start-Process 'ncpa.cpl' } },
+        @{ Key='5'; Label='Return'; Exit=$true }
+    )
+    Invoke-DataMenu -Title '=== Network Tools ===' -Items $items -Color Cyan -StatusBlock $statusBlock
+}
+
+# GPU info for the Nvidia menus. Fetched once on demand and cached
+# (the specs worker does its own query, so this never competes with startup).
+# On laptops with an Intel iGPU plus a discrete card, NVIDIA is preferred, then AMD, then Intel.
 function Get-GpuInformation {
     if (-not $script:GpuCache) {
-        $names = @(Get-CimInstance -ClassName Win32_VideoController -Property Name |
-            Where-Object { $_.Name -match 'NVIDIA|AMD|Radeon|Intel' } |
-            ForEach-Object { $_.Name })
-        $pick = $names | Where-Object { $_ -match 'NVIDIA' } | Select-Object -First 1
-        if (-not $pick) { $pick = $names | Where-Object { $_ -match 'AMD|Radeon' } | Select-Object -First 1 }
-        if (-not $pick) { $pick = $names | Select-Object -First 1 }
-        $script:GpuCache = if ($pick) { $pick } else { "Not Found" }
+        $cards = @(Get-CimInstance -ClassName Win32_VideoController -Property Name, DriverVersion)
+        $pick = $cards | Where-Object { $_.Name -match 'NVIDIA' } | Select-Object -First 1
+        if (-not $pick) { $pick = $cards | Where-Object { $_.Name -match 'AMD|Radeon' } | Select-Object -First 1 }
+        if (-not $pick) { $pick = $cards | Where-Object { $_.Name -match 'Intel' } | Select-Object -First 1 }
+        if (-not $pick) { $pick = $cards | Select-Object -First 1 }
+        $script:GpuCache = if ($pick) { $pick.Name } else { 'Not Found' }
+        $script:GpuDriverCache = if ($pick -and $pick.DriverVersion) { $pick.DriverVersion } else { 'Unknown' }
     }
     return $script:GpuCache
 }
 
-# Specs are stored as small typed objects instead of strings that get re-parsed
-# when printing. Only the CIM classes we actually need are queried, with only the
-# properties we show. Drive sizes come from Win32_LogicalDisk, so each volume
-# reports its own size (previously it reported the whole physical disk).
-function Get-SystemSpecifications {
-    $specs = New-Object 'System.Collections.Generic.List[object]'
-    $specs.Add([pscustomobject]@{ Kind = 'Text'; Text = '==== System Specifications ====' })
-
-    $board = Get-CimInstance -ClassName Win32_BaseBoard -Property Product | Select-Object -First 1
-    $specs.Add([pscustomobject]@{ Kind = 'Field'; Label = 'Motherboard: '; Value = $board.Product })
-
-    $cpu = Get-CimInstance -ClassName Win32_Processor -Property Name, NumberOfCores, NumberOfLogicalProcessors | Select-Object -First 1
-    $specs.Add([pscustomobject]@{
-        Kind    = 'Cpu'
-        Label   = 'CPU: '
-        Name    = $cpu.Name.Trim()
-        Cores   = $cpu.NumberOfCores
-        Threads = $cpu.NumberOfLogicalProcessors
-    })
-
-    $mem = @(Get-CimInstance -ClassName Win32_PhysicalMemory -Property Capacity, Speed)
-    $ramGB = [math]::Round(($mem | Measure-Object -Property Capacity -Sum).Sum / 1GB, 2)
-    $specs.Add([pscustomobject]@{
-        Kind  = 'Field'
-        Label = 'RAM: '
-        Value = "$ramGB GB ($($mem.Count) sticks @ $($mem[0].Speed)MHz)"
-    })
-
-    $specs.Add([pscustomobject]@{ Kind = 'Gpu'; Label = 'GPU: '; Value = (Get-GpuInformation) })
-
-    $specs.Add([pscustomobject]@{ Kind = 'Text'; Text = 'Disk Info:' })
-    $volumes = Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3' -Property DeviceID, Size, FreeSpace |
-        Sort-Object DeviceID
-    foreach ($v in $volumes) {
-        $specs.Add([pscustomobject]@{
-            Kind  = 'Drive'
-            Label = "Drive $($v.DeviceID) | Total: "
-            Total = ("{0:N2} GB" -f ($v.Size / 1GB))
-            Used  = ("{0:N2} GB" -f (($v.Size - $v.FreeSpace) / 1GB))
-            Free  = ("{0:N2} GB" -f ($v.FreeSpace / 1GB))
-        })
-    }
-
-    $specs.Add([pscustomobject]@{ Kind = 'Text'; Text = '==============================' })
-    return $specs
-}
-
+### System specifications ###
 # This exists purely to make the output look good. I wanted brand colors
 # Intel blue, AMD red, NVIDIA green because the eye candy is always appreciated
 # and it makes scanning the output much faster at a glance.
@@ -262,15 +826,27 @@ function Write-SystemSpecifications {
     }
 }
 
-function Show-SystemSpecifications {
-    # Specs are cached after the first load the hardware isn't going anywhere.
-    # The loading screen only shows once per session.
-    if (-not $script:SystemSpecsCache) {
+# Specs come from the background prefetch. If it's still running we wait on it (with the
+# loading screen); if it never started or failed, we collect them here instead.
+function Initialize-SystemSpecs {
+    if ($script:SystemSpecsCache) { return }
+    $state = Update-BgJob -Name 'Specs'
+    if ($state -eq $false) {
         Start-Loading
-        $script:SystemSpecsCache = Get-SystemSpecifications
+        $state = Update-BgJob -Name 'Specs' -Wait
     }
-    Write-SystemSpecifications
+    if ($state -eq $true) {
+        $data = @($script:BgData['Specs'])
+        if ($data.Count) { $script:SystemSpecsCache = $data; return }
+    }
+    Start-Loading
+    $script:SystemSpecsCache = @(& $script:SpecsQuery)
+}
+
+function Show-SystemSpecifications {
+    Initialize-SystemSpecs
     while ($true) {
+        Write-SystemSpecifications
         Write-Host ""
         Write-Host "1. Export to desktop"
         Write-Host "2. Return"
@@ -287,11 +863,17 @@ function Show-SystemSpecifications {
                         'Drive' { "$($e.Label)$($e.Total) | Used: $($e.Used) | Free: $($e.Free)" }
                     }
                 }
-                $linesToWrite | Out-File -FilePath $exportPath -Encoding UTF8
-                Write-Host "`nExported to: $exportPath" -ForegroundColor Green
+                try {
+                    $linesToWrite | Out-File -FilePath $exportPath -Encoding UTF8 -ErrorAction Stop
+                    Write-ToolChange "Exported system specifications to '$exportPath'"
+                    Write-Host "`nExported to: $exportPath" -ForegroundColor Green
+                } catch {
+                    Write-Host "`nExport failed: $_" -ForegroundColor Red
+                }
+                Read-Host "Press Enter to return to specifications" | Out-Null
             }
             { $_ -in '2', 'q' } { return }
-            default { Write-Host "Invalid option. Please select 1, 2 or Q." -ForegroundColor Red }
+            default { Write-Host "Invalid option. Please select 1, 2 or Q." -ForegroundColor Red; Start-Sleep -Milliseconds 900 }
         }
     }
 }
@@ -320,6 +902,7 @@ URL=windowsdefender://coreisolation/
 
 ### DLSS ###
 $script:DlssPath = "HKLM:\SOFTWARE\NVIDIA Corporation\Global\NGXCore"
+$script:RegExe = Join-Path $env:windir 'System32\reg.exe'
 
 function Get-DLSSIndicatorStatus {
     $value = (Get-ItemProperty -Path $script:DlssPath -Name "ShowDlssIndicator" -ErrorAction SilentlyContinue).ShowDlssIndicator
@@ -327,35 +910,29 @@ function Get-DLSSIndicatorStatus {
     return "DISABLED"
 }
 
+# reg.exe creates the key if it's missing and needs no PowerShell host to run.
 function Set-DLSSIndicator {
     param([bool]$Enable)
-    if (-not (Test-AdminOrWarn)) { return }
-    if (-not (Test-Path $script:DlssPath)) { New-Item -Path $script:DlssPath -Force | Out-Null }
     $value = if ($Enable) { 0x400 } else { 0 }
-    Set-ItemProperty -Path $script:DlssPath -Name "ShowDlssIndicator" -Type DWord -Value $value
+    $state = if ($Enable) { 'enabled' } else { 'disabled' }
+    [void](Invoke-Elevated -File $script:RegExe `
+        -Arguments "add `"HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore`" /v ShowDlssIndicator /t REG_DWORD /d $value /f" `
+        -Change "Set NVIDIA DLSS indicator to $state")
 }
 
 function Show-DLSSMenu {
-    while ($true) {
-        Clear-Host
-        Write-Host "=== DLSS UI Options ===" -ForegroundColor Cyan
-        Write-Host @"
-1. Enable DLSS UI
-2. Disable DLSS UI
-3. Return
-"@ -ForegroundColor White
+    $statusBlock = {
         $status = Get-DLSSIndicatorStatus
         $color = if ($status -eq "ENABLED") { "Green" } else { "Red" }
         Write-Host "Status: DLSS UI is currently $status." -ForegroundColor $color
         Write-Host "=======================" -ForegroundColor Cyan
-        $choice = Read-Host "Select an option"
-        switch ($choice) {
-            '1' { Set-DLSSIndicator -Enable $true }
-            '2' { Set-DLSSIndicator -Enable $false }
-            { $_ -in '3', 'q' } { return }
-            default { Write-Host "Invalid option, please try again." -ForegroundColor Red; Start-Sleep -Seconds 1 }
-        }
     }
+    $items = @(
+        @{ Key='1'; Label='Enable DLSS UI'; Action={ Set-DLSSIndicator -Enable $true } },
+        @{ Key='2'; Label='Disable DLSS UI'; Action={ Set-DLSSIndicator -Enable $false } },
+        @{ Key='3'; Label='Return'; Exit=$true }
+    )
+    Invoke-DataMenu -Title '=== DLSS UI Options ===' -Items $items -Color Cyan -StatusBlock $statusBlock
 }
 
 ### NIS ###
@@ -387,27 +964,21 @@ function Get-NISStatus {
     }
 }
 
+# The path is resolved here (reading HKLM needs no elevation), so the elevated part is a
+# single reg.exe call.
 function Set-NISMode {
     param([ValidateSet('New', 'Old')][string]$Mode)
-    if (-not (Test-AdminOrWarn)) { return }
-    $path = Get-NISRegistryPath
-    if (-not $path) {
-        $path = $script:NisPrimary
-        if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
-    }
     $value = if ($Mode -eq 'New') { 1 } else { 0 }
-    Set-ItemProperty -Path $path -Name $script:NisProperty -Type DWord -Value $value
+    $path = Get-NISRegistryPath
+    if (-not $path) { $path = $script:NisPrimary }
+    $regKey = $path -replace '^HKLM:\\', 'HKLM\'
+    [void](Invoke-Elevated -File $script:RegExe `
+        -Arguments "add `"$regKey`" /v $($script:NisProperty) /t REG_DWORD /d $value /f" `
+        -Change "Set NVIDIA Image Scaling mode to $Mode")
 }
 
 function Show-NISMenu {
-    while ($true) {
-        Clear-Host
-        Write-Host "=== NVIDIA Image Scaling (NIS) Options ===" -ForegroundColor Cyan
-        Write-Host @"
-1. Enable NEW NIS
-2. Enable OLD NIS
-3. Return
-"@ -ForegroundColor White
+    $statusBlock = {
         $status = Get-NISStatus
         $color = switch ($status) {
             "NEW" { "Green" }
@@ -416,105 +987,73 @@ function Show-NISMenu {
         }
         Write-Host "Status: NIS is currently set to $status." -ForegroundColor $color
         Write-Host "=========================================" -ForegroundColor Cyan
-        $choice = Read-Host "Select an option"
-        switch ($choice) {
-            '1' { Set-NISMode -Mode New }
-            '2' { Set-NISMode -Mode Old }
-            { $_ -in '3', 'q' } { return }
-            default { Write-Host "Invalid option, please try again." -ForegroundColor Red; Start-Sleep -Milliseconds 1350 }
-        }
     }
+    $items = @(
+        @{ Key='1'; Label='Enable NEW NIS'; Action={ Set-NISMode -Mode New } },
+        @{ Key='2'; Label='Enable OLD NIS'; Action={ Set-NISMode -Mode Old } },
+        @{ Key='3'; Label='Return'; Exit=$true }
+    )
+    Invoke-DataMenu -Title '=== NVIDIA Image Scaling (NIS) Options ===' -Items $items -Color Cyan -StatusBlock $statusBlock
 }
 
 ### Nvidia Tweaks Menu ###
-# GPU name is cached once and passed to the gates below, so no sub-menu fetches it
-# on its own. It also lets me gate features cleanly no point offering DLSS to someone on a GTX.
+# The GPU name is cached after the first lookup, and gates features cleanly:
+# no point offering DLSS to someone on a GTX.
 function NvidiaTweaksMenu {
-    $gpu = Get-GpuInformation
-
-    while ($true) {
-        Clear-Host
-        Write-Host "=== Nvidia Tweaks ===" -ForegroundColor Green
-        Write-Host "1. Toggle DLSS UI" -ForegroundColor White
-        Write-Host "2. Toggle Nvidia Image Scaling" -ForegroundColor White
-        Write-Host "3. Open NvidiaProfileInspector Releases" -ForegroundColor White
-        Write-Host "4. Return" -ForegroundColor White
-        Write-Host "======================" -ForegroundColor Green
-
-        $choice = Read-Host "Select an option"
-        switch ($choice) {
-            '1' {
-                Clear-Host
-                if ($gpu -notlike "NVIDIA GeForce RTX*") {
-                    Write-Host "DLSS UI is not supported on your GPU." -ForegroundColor Red
-                    Write-Host "Your GPU: $gpu" -ForegroundColor Yellow
-                    Start-Sleep -Milliseconds 1850
-                } else {
-                    Show-DLSSMenu
-                }
-            }
-            '2' {
-                Clear-Host
-                if ($gpu -notlike "NVIDIA*") {
-                    Write-Host "Nvidia Image Scaling is not supported on your GPU." -ForegroundColor Red
-                    Write-Host "Your GPU: $gpu" -ForegroundColor Yellow
-                    Start-Sleep -Milliseconds 1850
-                } else {
-                    Show-NISMenu
-                }
-            }
-            '3' { Start-Process "https://github.com/xHybred/NvidiaProfileInspectorRevamped/releases" }
-            { $_ -in '4', 'q' } { return }
-            default { Write-Host "Invalid Option." -ForegroundColor Red; Start-Sleep -Milliseconds 800 }
-        }
-    }
+    $items = @(
+        @{ Key='1'; Label='Toggle DLSS UI'; Action={
+            $gpu = Get-GpuInformation
+            if ($gpu -notlike 'NVIDIA GeForce RTX*') {
+                Write-Host 'DLSS UI is not supported on your GPU.' -ForegroundColor Red
+                Write-Host "Your GPU: $gpu" -ForegroundColor Yellow
+                Start-Sleep -Milliseconds 1850
+            } else { Show-DLSSMenu }
+        } },
+        @{ Key='2'; Label='Toggle NVIDIA Image Scaling'; Action={
+            $gpu = Get-GpuInformation
+            if ($gpu -notlike 'NVIDIA*') {
+                Write-Host 'NVIDIA Image Scaling is not supported on your GPU.' -ForegroundColor Red
+                Write-Host "Your GPU: $gpu" -ForegroundColor Yellow
+                Start-Sleep -Milliseconds 1850
+            } else { Show-NISMenu }
+        } },
+        @{ Key='3'; Label='Open NvidiaProfileInspector Releases'; Action={ Start-Process 'https://github.com/xHybred/NvidiaProfileInspectorRevamped/releases' } },
+        @{ Key='4'; Label='Return'; Exit=$true }
+    )
+    Invoke-DataMenu -Title '=== Nvidia Tweaks ===' -Items $items -Color Green
 }
 
 ### Bluetooth ###
+# Stays on PowerShell: stopping the service has to cope with dependent services,
+# which Stop-Service -Force handles for us.
 function Set-BluetoothService {
     param([bool]$Enable)
-    if (-not (Test-AdminOrWarn)) { return }
     if ($Enable) {
-        Set-Service -Name 'bthserv' -StartupType Manual
-        Start-Service -Name 'bthserv' -ErrorAction SilentlyContinue
+        $scriptText = "Set-Service -Name 'bthserv' -StartupType Manual -ErrorAction Stop`nStart-Service -Name 'bthserv' -ErrorAction Stop"
+        $change = 'Enabled Bluetooth Support Service and set startup to Manual'
     } else {
-        Stop-Service -Name 'bthserv' -Force -ErrorAction SilentlyContinue
-        Set-Service -Name 'bthserv' -StartupType Disabled
+        $scriptText = "Stop-Service -Name 'bthserv' -Force -ErrorAction Stop`nSet-Service -Name 'bthserv' -StartupType Disabled -ErrorAction Stop"
+        $change = 'Stopped Bluetooth Support Service and set startup to Disabled'
     }
+    [void](Invoke-AdminMutation -ScriptText $scriptText -Change $change)
 }
 
 function Show-Bluetooth-Discovery-Menu {
-    while ($true) {
-        Clear-Host
-        Write-Host @"
-1. Enable Bluetooth Support Service (Start & Set to Manual)
-2. Disable Bluetooth Discoverability (Stop & Disable Bluetooth Support Service)
-3. Return
-"@ -ForegroundColor White
+    $statusBlock = {
         $service = Get-Service -Name "bthserv" -ErrorAction SilentlyContinue
-        Write-Host ""
         if ($null -eq $service) {
             Write-Host "Status: Bluetooth Support Service not found." -ForegroundColor Yellow
         } else {
             if ($service.Status -eq "Running") { Write-Host "Status: ENABLED" -ForegroundColor Green }
             else { Write-Host "Status: DISABLED" -ForegroundColor Red }
         }
-        $choice = Read-Host "`nChoose an option"
-        switch ($choice) {
-            '1' {
-                Clear-Host
-                Write-Host "Enabling Bluetooth Support Service..."
-                Set-BluetoothService -Enable $true
-            }
-            '2' {
-                Clear-Host
-                Write-Host "Disabling Bluetooth Support Service..."
-                Set-BluetoothService -Enable $false
-            }
-            { $_ -in '3', 'q' } { return }
-            default { Write-Host "Invalid choice. Please enter 1, 2, 3 or q."; Start-Sleep -Seconds 1 }
-        }
     }
+    $items = @(
+        @{ Key='1'; Label='Enable Bluetooth Support Service (Start & Set to Manual)'; Action={ Set-BluetoothService -Enable $true } },
+        @{ Key='2'; Label='Disable Bluetooth Support Service'; Action={ Set-BluetoothService -Enable $false } },
+        @{ Key='3'; Label='Return'; Exit=$true }
+    )
+    Invoke-DataMenu -Title '=== Bluetooth Support Service ===' -Items $items -Color Cyan -Prompt 'Choose an option' -StatusBlock $statusBlock
 }
 
 ### Wallpaper ###
@@ -526,8 +1065,13 @@ function Export-DesktopWallpaper {
     if (Test-Path $wallpaperPath) {
         $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
         $desktopPath = Join-Path $desktopDir "Wallpaper_$timestamp.jpg"
-        Copy-Item -Path $wallpaperPath -Destination $desktopPath
-        Write-Host "Wallpaper extracted successfully to $desktopPath" -ForegroundColor Green
+        try {
+            Copy-Item -Path $wallpaperPath -Destination $desktopPath -ErrorAction Stop
+            Write-ToolChange "Exported desktop wallpaper to '$desktopPath'"
+            Write-Host "Wallpaper extracted successfully to $desktopPath" -ForegroundColor Green
+        } catch {
+            Write-Host "Could not export the wallpaper: $_" -ForegroundColor Red
+        }
     } else {
         Write-Host "Wallpaper file not found at $wallpaperPath" -ForegroundColor Yellow
     }
@@ -535,55 +1079,70 @@ function Export-DesktopWallpaper {
 }
 
 # Windows compresses wallpapers by default, which is a bit annoying when you've
-# set a carefully chosen image. This registry key sets the JPEG quality to 100
-# so what you see is actually what you set. Removing the key restores the default behavior.
-function Set-WallpaperDecompressor {
-    Clear-Host
-    $regPath = "HKCU:\Control Panel\Desktop"
-    $regName = "JPEGImportQuality"
-    Write-Host "Select mode:"
-    Write-Host "1. Uncompressed"
-    Write-Host "2. Compressed [Default]"
-    $choice = Read-Host "Enter your choice 1 or 2"
-    try {
-        $changed = $true
-        switch ($choice) {
-            "1" {
-                $existed = $null -ne (Get-ItemProperty -Path $regPath -Name $regName -ErrorAction SilentlyContinue)
-                Set-ItemProperty -Path $regPath -Name $regName -Type DWord -Value 100
-                if ($existed) { Write-Host "Set $regName to 100 (Uncompressed)." }
-                else { Write-Host "Created $regName with value 100 (Uncompressed)." }
-            }
-            "2" {
-                if (Get-ItemProperty -Path $regPath -Name $regName -ErrorAction SilentlyContinue) {
-                    Remove-ItemProperty -Path $regPath -Name $regName
-                    Write-Host "Removed $regName. Wallpaper compression set to default."
-                } else {
-                    Write-Host "$regName not set. Already at default compression."
-                    $changed = $false
-                }
-            }
-            default {
-                # This used to call 'exit', which closed the whole toolbox.
-                Write-Host "Invalid choice." -ForegroundColor Red
-                Start-Sleep -Milliseconds 800
-                return
-            }
-        }
-        if ($changed) {
-            Write-Host "Restarting Explorer..."
-            Restart-Explorer
-            Write-Host "Explorer restarted. Changes applied."
-        }
-        Start-Sleep -Milliseconds 1200
-    } catch {
-        Write-Host "Failed to modify registry: $_" -ForegroundColor Red
-        Start-Sleep -Seconds 2
+# set a carefully chosen image. The JPEGImportQuality value sets the JPEG quality to 100
+# so what you see is actually what you set. Removing it restores the default behavior.
+$script:WallpaperRegPath = 'Control Panel\Desktop'
+
+function Get-WallpaperQuality {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($script:WallpaperRegPath)
+    if (-not $key) { return $null }
+    try { return $key.GetValue('JPEGImportQuality') } finally { $key.Close() }
+}
+
+function Set-WallpaperQuality {
+    param([bool]$Uncompressed)
+    $current = Get-WallpaperQuality
+    $already = if ($Uncompressed) { $current -eq 100 } else { $null -eq $current }
+    if ($already) {
+        Show-Notice '=== Wallpaper Quality ===' 'Already set, nothing to change.' Yellow 1000
+        return
     }
+    try {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($script:WallpaperRegPath, $true)
+        try {
+            if ($Uncompressed) { $key.SetValue('JPEGImportQuality', 100, [Microsoft.Win32.RegistryValueKind]::DWord) }
+            else { $key.DeleteValue('JPEGImportQuality', $false) }
+        } finally { $key.Close() }
+    } catch {
+        Show-Notice '=== Wallpaper Quality ===' "Failed to modify registry: $_" Red 2000
+        return
+    }
+    if ($Uncompressed) { Write-ToolChange 'Set wallpaper JPEG import quality to 100 (uncompressed)' }
+    else { Write-ToolChange 'Restored default wallpaper compression' }
+    Clear-Host
+    Write-Host '=== Wallpaper Quality ===' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host 'Restarting Explorer...' -ForegroundColor Yellow
+    Restart-Explorer
+    Write-Host 'Done. Changes applied.' -ForegroundColor Green
+    Start-Sleep -Milliseconds 900
+}
+
+function Show-WallpaperQualityMenu {
+    $statusBlock = {
+        $quality = Get-WallpaperQuality
+        if ($quality -eq 100) { Write-Host 'Status: Wallpapers are currently Uncompressed.' -ForegroundColor Green }
+        elseif ($null -eq $quality) { Write-Host 'Status: Wallpapers are currently Compressed (Windows default).' -ForegroundColor Red }
+        else { Write-Host "Status: Wallpapers use a custom JPEG quality ($quality)." -ForegroundColor Yellow }
+        Write-Host '=========================' -ForegroundColor Cyan
+    }
+    $items = @(
+        @{ Key='1'; Label='Uncompressed (JPEG quality 100)'; Action={ Set-WallpaperQuality -Uncompressed $true } },
+        @{ Key='2'; Label='Compressed [Default]'; Action={ Set-WallpaperQuality -Uncompressed $false } },
+        @{ Key='3'; Label='Return'; Exit=$true }
+    )
+    Invoke-DataMenu -Title '=== Wallpaper Quality ===' -Items $items -Color Cyan -StatusBlock $statusBlock
 }
 
 ### PowerShell History ###
 function Remove-PowerShellHistory {
+    $confirmation = Read-Host 'Delete the PowerShell history file and in-memory history? (Y/N)'
+    if ($confirmation -notmatch '^(y|yes)$') {
+        Write-Host "History deletion cancelled." -ForegroundColor Yellow
+        Start-Sleep -Milliseconds 900
+        return
+    }
+
     # Ask PSReadLine where the history really lives (works for Windows PowerShell and pwsh).
     $historyPath = $null
     try { $historyPath = (Get-PSReadLineOption).HistorySavePath } catch { }
@@ -593,11 +1152,16 @@ function Remove-PowerShellHistory {
     try { [Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory() } catch { }
     Clear-History -ErrorAction SilentlyContinue
 
-    if (Test-Path $historyPath) {
-        Remove-Item $historyPath -Force
-        Write-Host "PowerShell history deleted." -ForegroundColor Green
-    } else {
-        Write-Host "PowerShell history file not found or already deleted" -ForegroundColor Yellow
+    try {
+        if (Test-Path $historyPath) {
+            Remove-Item $historyPath -Force -ErrorAction Stop
+            Write-Host "PowerShell history deleted." -ForegroundColor Green
+        } else {
+            Write-Host "PowerShell history file not found or already deleted" -ForegroundColor Yellow
+        }
+        Write-ToolChange 'Cleared in-memory PowerShell history and deleted the history file if it existed'
+    } catch {
+        Write-Host "Could not delete the history file: $_" -ForegroundColor Red
     }
     Start-Sleep -Seconds 1
 }
@@ -614,142 +1178,122 @@ function Get-ContextMenuStatus {
 function Enable-ContextMenu {
     $path = "$($script:ClassicMenuClsid)\InprocServer32"
     if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
-    Set-ItemProperty -Path $path -Name "(Default)" -Value ""
+    Set-ItemProperty -Path $path -Name "(Default)" -Value "" -ErrorAction Stop
+    Write-ToolChange 'Enabled the classic Windows 11 context menu'
     Restart-Explorer
 }
 
 function Disable-ContextMenu {
+    $wasEnabled = Test-Path "$($script:ClassicMenuClsid)\InprocServer32"
     Remove-Item -Path $script:ClassicMenuClsid -Recurse -Force -ErrorAction SilentlyContinue
+    if ($wasEnabled) { Write-ToolChange 'Restored the default Windows 11 context menu' }
     Restart-Explorer
 }
 
 function Show-ContextMenu {
-    while ($true) {
-        Clear-Host
-        Write-Host "=== Windows 11 Context Menu ===" -ForegroundColor Cyan
-        Write-Host @"
-1. Enable classic context menu
-2. Restore Windows 11 default
-3. Return
-"@ -ForegroundColor White
+    if ($osVersion -notlike 'Windows 11*') {
+        Write-Host "The Windows 11 context menu option is only available on Windows 11." -ForegroundColor Red
+        Start-Sleep -Milliseconds 1600
+        return
+    }
+    $statusBlock = {
         $status = Get-ContextMenuStatus
-        # This compared against "TWEAKED", which the status function never returns.
         $color = if ($status -eq "Windows Classic") { "Green" } else { "Red" }
         Write-Host "Status: Context menu is currently $status." -ForegroundColor $color
         Write-Host "===============================" -ForegroundColor Cyan
-        $choice = Read-Host "Select an option"
-        switch ($choice) {
-            '1' { Enable-ContextMenu }
-            '2' { Disable-ContextMenu }
-            { $_ -in '3', 'q' } { return }
-            default { Write-Host "Invalid option, please try again." -ForegroundColor Red; Start-Sleep -Seconds 1 }
-        }
     }
+    $items = @(
+        @{ Key='1'; Label='Enable classic context menu'; Action={ Enable-ContextMenu } },
+        @{ Key='2'; Label='Restore Windows 11 default'; Action={ Disable-ContextMenu } },
+        @{ Key='3'; Label='Return'; Exit=$true }
+    )
+    Invoke-DataMenu -Title '=== Windows 11 Context Menu ===' -Items $items -Color Cyan -StatusBlock $statusBlock
 }
-
 
 ### Spicetify ###
-# Adds a Spicetify update shortcut to the desktop background right-click menu.
-# Uses HKCU\Software\Classes, so no administrator privileges are required.
-# The command runs as the current user, without elevation.
+# Right-click entry on the desktop background that runs "spicetify update".
+# The command is stored as -EncodedCommand, so the registry value has no quotes or pipe
+# characters for the shell to mangle; -NoExit keeps the window open to read the output.
+# The entry lives under HKCU (per-user, no admin needed). Older versions of this toolbox
+# wrote a machine-wide copy under HKLM; that one can only be removed with admin rights,
+# so it is detected separately and cleaned up (one UAC prompt) when you apply or remove.
+# Registry access is plain .NET: no provider overhead and no quirks with the "(Default)" value.
+$script:SpicetifySubKey = 'Software\Classes\DesktopBackground\Shell\SpicetifyUpdate'
+$script:SpicetifyMachineKey = 'HKLM\SOFTWARE\Classes\DesktopBackground\Shell\SpicetifyUpdate'
+$script:SpicetifyRunCmd = 'spicetify update'
+$script:WinPowerShell = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$script:SpicetifyCommand = '"' + $script:WinPowerShell + '" -NoProfile -NoExit -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script:SpicetifyRunCmd))
 
-$script:SpicetifyKey = "HKCU:\Software\Classes\DesktopBackground\Shell\SpicetifyUpdate"
-
-function Get-SpicetifyStatus {
-    $userKey = "$script:SpicetifyKey\command"
-    $machineKey = "HKLM:\SOFTWARE\Classes\DesktopBackground\Shell\SpicetifyUpdate\command"
-    $mergedKey = "Registry::HKEY_CLASSES_ROOT\DesktopBackground\Shell\SpicetifyUpdate\command"
-
-    if (-not (Test-Path $mergedKey)) {
-        return "NOT APPLIED"
-    }
-
-    $command = (Get-Item -Path $mergedKey).GetValue("")
-
-    if ($command -match "spicetify\s+update") {
-        return "APPLIED"
-    }
-
-    return "BROKEN"
+function Test-SpicetifyMachineEntry {
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Classes\DesktopBackground\Shell\SpicetifyUpdate')
+    if (-not $key) { return $false }
+    $key.Close()
+    return $true
 }
 
-function Invoke-SpicetifyContextMenu {
-    param([switch]$Apply)
+# APPLIED = current entry in place. OUTDATED = an older entry exists (different command,
+# or the old machine-wide copy), and applying replaces it. NOT APPLIED = nothing there.
+function Get-SpicetifyStatus {
+    if (Test-SpicetifyMachineEntry) { return 'OUTDATED' }
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$($script:SpicetifySubKey)\command")
+    if (-not $key) { return 'NOT APPLIED' }
+    try { $command = $key.GetValue('') } finally { $key.Close() }
+    if ($command -eq $script:SpicetifyCommand) { return 'APPLIED' }
+    return 'OUTDATED'
+}
 
-    $key = $script:SpicetifyKey
-
-    if ($Apply) {
-        # Create the context menu entry.
-        New-Item -Path $key -Force | Out-Null
-
-        Set-ItemProperty -Path $key -Name "MUIVerb" -Value "Spicetify Update"
-        Set-ItemProperty -Path $key -Name "Icon" -Value "$env:APPDATA\Spotify\Spotify.exe"
-        Set-ItemProperty -Path $key -Name "Position" -Value "Middle"
-
-        # Create the command subkey.
-        $commandKey = "$key\command"
-        New-Item -Path $commandKey -Force | Out-Null
-
-        # Set the actual registry default value (unnamed).
-        Set-Item -Path $commandKey -Value 'powershell.exe -NoProfile -NoExit -Command "spicetify update"'
-
-        Write-Host "Spicetify context menu entry applied." -ForegroundColor Green
+function Set-SpicetifyContextMenu {
+    param([bool]$Apply)
+    $before = Get-SpicetifyStatus
+    if (-not $Apply -and $before -eq 'NOT APPLIED') {
+        Show-Notice '=== Spicetify Context Menu ===' 'Nothing to remove.' Yellow 1000
+        return
     }
-    else {
-        # Remove the per-user entry.
-        Remove-Item -Path $key -Recurse -Force -ErrorAction SilentlyContinue
-
-        # Remove legacy machine-wide entries when running as administrator.
-        if ($script:IsAdmin) {
-            Remove-Item -Path "HKLM:\SOFTWARE\Classes\DesktopBackground\Shell\SpicetifyUpdate" -Recurse -Force -ErrorAction SilentlyContinue
+    try {
+        if (Test-SpicetifyMachineEntry) {
+            $removed = Invoke-Elevated -File $script:RegExe `
+                -Arguments "delete `"$($script:SpicetifyMachineKey)`" /f" `
+                -Change 'Removed the old machine-wide Spicetify context-menu entry'
+            if (-not $removed) { return }
         }
-
-        Write-Host "Spicetify context menu entry removed." -ForegroundColor Yellow
+        $hkcu = [Microsoft.Win32.Registry]::CurrentUser
+        $hkcu.DeleteSubKeyTree($script:SpicetifySubKey, $false)   # always start clean
+        if ($Apply) {
+            $key = $hkcu.CreateSubKey($script:SpicetifySubKey)
+            try {
+                $key.SetValue('MUIVerb', 'Update Spicetify')
+                $icon = Join-Path $env:APPDATA 'Spotify\Spotify.exe'
+                if ([IO.File]::Exists($icon)) { $key.SetValue('Icon', $icon) }
+            } finally { $key.Close() }
+            $commandKey = $hkcu.CreateSubKey("$($script:SpicetifySubKey)\command")
+            try { $commandKey.SetValue('', $script:SpicetifyCommand) } finally { $commandKey.Close() }
+            Write-ToolChange 'Added the Spicetify update desktop context-menu entry'
+            Show-Notice '=== Spicetify Context Menu ===' 'Added. Right-click the desktop to use it.' Green 1200
+        } else {
+            Write-ToolChange 'Removed the Spicetify desktop context-menu entry'
+            Show-Notice '=== Spicetify Context Menu ===' 'Removed.' Green 1000
+        }
+    } catch {
+        Show-Notice '=== Spicetify Context Menu ===' "Could not update the entry: $_" Red 2000
     }
 }
 
 function Show-SpicetifyMenu {
-    while ($true) {
-        Clear-Host
-
-        Write-Host "=== Spicetify Context Menu ===" -ForegroundColor Green
-        Write-Host @"
-1. Apply context menu entry
-2. Remove context menu entry
-3. Return
-"@ -ForegroundColor White
-
-        $status = Get-SpicetifyStatus
-
-        $color = switch ($status) {
-            "APPLIED"     { "Green" }
-            "BROKEN"      { "Yellow" }
-            default       { "Red" }
+    $statusBlock = {
+        switch (Get-SpicetifyStatus) {
+            'APPLIED'  { Write-Host 'Status: APPLIED' -ForegroundColor Green }
+            'OUTDATED' { Write-Host 'Status: OUTDATED (old entry found, choose 1 to replace it)' -ForegroundColor Yellow }
+            default    { Write-Host 'Status: NOT APPLIED' -ForegroundColor Red }
         }
-
-        Write-Host "Status: $status" -ForegroundColor $color
-        Write-Host "==============================" -ForegroundColor Green
-
-        $choice = Read-Host "Select an option"
-
-        switch ($choice) {
-            '1' {
-                Invoke-SpicetifyContextMenu -Apply
-                Start-Sleep -Milliseconds 800
-            }
-            '2' {
-                Invoke-SpicetifyContextMenu
-                Start-Sleep -Milliseconds 800
-            }
-            { $_ -in '3', 'q' } {
-                return
-            }
-            default {
-                Write-Host "Invalid option." -ForegroundColor Red
-                Start-Sleep -Milliseconds 800
-            }
-        }
+        Write-Host "Runs: $($script:SpicetifyRunCmd)" -ForegroundColor DarkGray
+        Write-Host '==============================' -ForegroundColor Green
     }
+    $items = @(
+        @{ Key='1'; Label='Add right-click entry (spicetify update)'; Action={ Set-SpicetifyContextMenu -Apply $true } },
+        @{ Key='2'; Label='Remove right-click entry'; Action={ Set-SpicetifyContextMenu -Apply $false } },
+        @{ Key='3'; Label='Return'; Exit=$true }
+    )
+    Invoke-DataMenu -Title '=== Spicetify Context Menu ===' -Items $items -Color Green -StatusBlock $statusBlock
 }
 
 ### Wi-Fi ###
@@ -796,40 +1340,60 @@ function Show-WifiPasswords {
 
 ### Windows Tweaks Menu ###
 function WindowsTweaksMenu {
-    while ($true) {
-        Clear-Host
-        Write-Host "--- [Windows Tweaks] ---" -ForegroundColor Blue
-        Write-Host @"
-1.  Toggle Bluetooth Discovery
-2.  Export Desktop Wallpaper
-3.  Delete PowerShell History
-4.  Toggle Wallpaper Decompressor
-5.  Toggle Windows 11 Context Menu Style
-6.  Spicetify Updater on right click context menu (Requires Spotify)
-7.  Show Wi-Fi passwords already discovered
-8.  Return
-"@ -ForegroundColor White
-        $choice = Read-Host "Select an option"
-        switch ($choice) {
-            '1' { Show-Bluetooth-Discovery-Menu }
-            '2' { Export-DesktopWallpaper }
-            '3' { Remove-PowerShellHistory }
-            '4' { Set-WallpaperDecompressor }
-            '5' { Show-ContextMenu }
-            '6' { Show-SpicetifyMenu }
-            '7' { Show-WifiPasswords }
-            { $_ -in '8', 'q' } { return }
-            default { Write-Host "Invalid Option." -ForegroundColor Red; Start-Sleep -Milliseconds 800 }
-        }
-    }
+    $items = @(
+        @{ Key='1'; Label='Toggle Bluetooth Discovery'; Action={ Show-Bluetooth-Discovery-Menu } },
+        @{ Key='2'; Label='Export Desktop Wallpaper'; Action={ Export-DesktopWallpaper } },
+        @{ Key='3'; Label='Delete PowerShell History'; Action={ Remove-PowerShellHistory } },
+        @{ Key='4'; Label='Toggle Wallpaper Decompressor'; Action={ Show-WallpaperQualityMenu } },
+        @{ Key='5'; Label='Toggle Windows 11 Context Menu Style [W11]'; Action={ Show-ContextMenu } },
+        @{ Key='6'; Label='Spicetify update on right-click context menu'; Action={ Show-SpicetifyMenu } },
+        @{ Key='7'; Label='Show saved Wi-Fi passwords'; Action={ Show-WifiPasswords } },
+        @{ Key='8'; Label='Return'; Exit=$true }
+    )
+    Invoke-DataMenu -Title '--- [Windows Tweaks] ---' -Items $items -Color Blue
 }
 
-# Everything starts here.
+### Startup ###
+# Everything above is only function definitions, so the loading screen appears right away.
+# Order matters for speed: the worker threads are launched first, so the activation and
+# specs queries overlap with the lookups the header needs instead of running after them.
 try {
+    Start-Loading
+
+    try {
+        $script:Pool = [RunspaceFactory]::CreateRunspacePool(1, 2)
+        $script:Pool.Open()
+    } catch { $script:Pool = $null }
+
+    Start-BgJob -Name 'Activation' -Work $script:ActivationQuery
+    if ($script:PrefetchSpecs) { Start-BgJob -Name 'Specs' -Work $script:SpecsQuery }
+    if (-not $script:Jobs.ContainsKey('Activation')) { $script:ActivationStatus = 'Unknown' }
+
+    $userName = [Security.Principal.WindowsIdentity]::GetCurrent().Name.Split('\')[-1]
+
+    $osInfo = Get-CimInstance -ClassName Win32_OperatingSystem -Property Caption, LastBootUpTime
+    $osVersion = $osInfo.Caption -replace '^Microsoft ', ''
+    $script:LastBoot = $osInfo.LastBootUpTime   # Cached once, uptime is computed live from this
+
+    $timezoneDisplayName = [TimeZoneInfo]::Local.DisplayName
+
+    # Domain-joined machines report their DNS domain instantly via .NET.
+    # Workgroup machines return nothing there, so only then do we fall back to CIM.
+    $domain = [Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().DomainName
+    if (-not $domain) { $domain = (Get-CimInstance -ClassName Win32_ComputerSystem -Property Domain).Domain }
+
+    $ip = Get-PrimaryIPv4
+
     Show-MainMenu
 } finally {
     # Clean up the temp shortcut from Core Isolation, if one was made.
     if ($script:CoreIsoUrlFile -and (Test-Path $script:CoreIsoUrlFile)) {
         Remove-Item -Path $script:CoreIsoUrlFile -Force -ErrorAction SilentlyContinue
     }
+    # Ask any unfinished worker to stop without waiting for it, so exiting is never slowed
+    # down by a WMI query that is still running.
+    foreach ($job in @($script:Jobs.Values)) {
+        try { [void]$job.PS.BeginStop($null, $null) } catch { }
+    }
+    if ($script:Pool) { try { [void]$script:Pool.BeginClose($null, $null) } catch { } }
 }
